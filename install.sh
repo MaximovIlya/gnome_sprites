@@ -4,6 +4,7 @@
 #        ./install.sh airship    -> only the airship
 #        ./install.sh fox        -> only the fox
 #        ./install.sh cat        -> only the cat
+#        ./install.sh dogfight   -> only the dogfight
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -14,8 +15,9 @@ case "${1:-all}" in
     fox) EXTS=(fox-pet@local) ;;
     airship) EXTS=(airship-pet@local) ;;
     cat) EXTS=(cat-pet@local) ;;
-    all) EXTS=(fox-pet@local airship-pet@local cat-pet@local) ;;
-    *) echo "usage: $0 [fox|cat|airship|all]" >&2; exit 1 ;;
+    dogfight) EXTS=(dogfight@local) ;;
+    all) EXTS=(fox-pet@local airship-pet@local cat-pet@local dogfight@local) ;;
+    *) echo "usage: $0 [fox|cat|airship|dogfight|all]" >&2; exit 1 ;;
 esac
 
 for uuid in "${EXTS[@]}"; do
