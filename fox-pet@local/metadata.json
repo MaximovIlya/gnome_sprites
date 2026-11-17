@@ -1,0 +1,7 @@
+{
+  "uuid": "fox-pet@local",
+  "name": "Fox Pet",
+  "description": "A little pixel-art fox that lives on your desktop.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 3
+}

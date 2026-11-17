@@ -1,0 +1,7 @@
+{
+  "uuid": "airship-pet@local",
+  "name": "Airship Pet",
+  "description": "A little pixel-art airship that drifts across your desktop sky.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}
