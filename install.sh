@@ -1,8 +1,9 @@
 #!/bin/bash
 # Install the desktop pets as GNOME Shell extensions for the current user.
-# Usage: ./install.sh            -> install both
+# Usage: ./install.sh            -> install all
 #        ./install.sh airship    -> only the airship
 #        ./install.sh fox        -> only the fox
+#        ./install.sh cat        -> only the cat
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -12,8 +13,9 @@ mkdir -p "$DEST"
 case "${1:-all}" in
     fox) EXTS=(fox-pet@local) ;;
     airship) EXTS=(airship-pet@local) ;;
-    all) EXTS=(fox-pet@local airship-pet@local) ;;
-    *) echo "usage: $0 [fox|airship|all]" >&2; exit 1 ;;
+    cat) EXTS=(cat-pet@local) ;;
+    all) EXTS=(fox-pet@local airship-pet@local cat-pet@local) ;;
+    *) echo "usage: $0 [fox|cat|airship|all]" >&2; exit 1 ;;
 esac
 
 for uuid in "${EXTS[@]}"; do
