@@ -25,7 +25,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const TICK_MS = 33;
 
 // sprite geometry (logical px) — must match gen_sprites3d.py
-const CELL = 112;
+const CELL = 176;
 const AZ_N = 25, AZ_STEP = Math.PI / 24;
 const EL_N = 12, EL0 = -82.5 * Math.PI / 180, EL_STEP = Math.PI / 12;
 const ATLAS_W = CELL * AZ_N, ATLAS_H = CELL * EL_N;
@@ -50,7 +50,7 @@ const ROLL = 0.17;                 // rad/tick
 const PULL = 0.068;                // rad/tick
 const BULLET_SPEED = 24;
 const BULLET_LIFE = 34;
-const HIT_R = 26;
+const HIT_R = 40;
 const GRAV = 0.2;
 
 const DEFAULTS = {visible: true, aboveWindows: true, perTeam: 2};

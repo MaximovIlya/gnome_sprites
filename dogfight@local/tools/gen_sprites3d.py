@@ -23,7 +23,7 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFilter, ImageChops
 
-CELL = 112
+CELL = 176
 SS = 3
 K = 0.85                     # sprite px per body unit = K * CELL
 AZ_N, AZ_STEP = 25, 7.5
