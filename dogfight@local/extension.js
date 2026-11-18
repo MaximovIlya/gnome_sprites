@@ -53,13 +53,19 @@ const TRACER = {wood: '#ffa050', desert: '#fff27a'};
 
 // tuning (world units are logical px at depth 0, multiplied by scale factor)
 const FOCAL = 1000;
-const DZ_MIN = -60, DZ_MAX = 1100;
-const MAX_HP = 9;
-const SPEED = 6.5;
-const ROLL = 0.17;                 // rad/tick
-const PULL = 0.068;                // rad/tick
-const BULLET_SPEED = 24;
-const BULLET_LIFE = 34;
+const DZ_MIN = -60, DZ_MAX = 1500;
+const MAX_HP = 6;
+// flight model: fast jets with G-limited turns (turn rate = max lateral accel / speed),
+// so at cruise speed the turn radius is SPEED^2 / G_MAX (~520 world units, ~3.5 body lengths; was ~95)
+const SPEED = 12.5;                // cruise speed, world units/tick
+const V_MIN = 0.72;                // corner speed floor (fraction of SPEED) after bleeding energy
+const G_MAX = 0.3;                 // max lateral acceleration, world units/tick^2
+const G_ONSET = 0.012;             // how fast the pilot can load/unload G, per tick (fraction of G_MAX)
+const ROLL = 0.075;                // max roll rate, rad/tick (~130 deg/s)
+const ROLL_ACC = 0.012;            // roll acceleration, rad/tick^2
+const YAW = 0.0035;                // tiny rudder correction while tracking, rad/tick
+const BULLET_SPEED = 34;
+const BULLET_LIFE = 30;
 const HIT_R = 40;
 const GRAV = 0.2;
 const CAM_H = 110;                 // camera height above the ground
@@ -160,6 +166,8 @@ class Jet {
         this.F = norm([-sx, rand(-0.08, 0.12), rand(-0.35, 0.35)]);
         this.U = ortho(this.F, UP);
         this.v = SPEED * sf;
+        this.g = 0;        // current G load, 0..1 of G_MAX
+        this.rr = 0;       // current roll rate
         this.hp = MAX_HP;
         this.ai = 'attack';
         this.aiT = 0;
@@ -222,11 +230,11 @@ class Jet {
             aim = Math.acos(clamp(dot(D, this.F), -1, 1));
             if (this._threatened(enemies) && Math.random() < 0.05) {
                 this.ai = 'evade';
-                this.aiT = randi(25, 50);
+                this.aiT = randi(40, 70);
                 this.evadeDir = norm(cross(this.F, [rand(-1, 1), rand(-1, 1), rand(-1, 1)]));
-            } else if (dist < 130 * sf && aim < 1.2) {
+            } else if (dist < 260 * sf && aim < 1.2) {
                 this.ai = 'extend';
-                this.aiT = randi(20, 35);
+                this.aiT = randi(35, 60);
             }
         } else {
             // nobody to fight: lazy circles
@@ -239,41 +247,45 @@ class Jet {
             if (o === this || o.state !== 'fly')
                 continue;
             const away = sub(this.p, o.p);
-            if (len(away) < 80 * sf)
+            if (len(away) < 160 * sf)
                 D = norm(add(D, norm(away), 0.9));
         }
 
-        // stay inside the visible volume
-        const dz = -this.p[2];
+        // stay around the visible volume; we can't turn on a dime, so look ahead
+        const ahead = add(this.p, this.F, this.v * 22);
+        const dz = clamp(-ahead[2], DZ_MIN * sf, 4000 * sf);
         const s = w.focal / (w.focal + dz);
         const halfW = w.W / 2 / s;
         const top = (w.H - 50 * sf - w.camH * (1 - s)) / s;
         const floor = 120 * sf / s;
         const midY = (top + floor) / 2;
         const midZ = (DZ_MIN + DZ_MAX) / 2 * sf;
-        const nx = Math.abs(this.p[0]) / halfW;
-        const ny = Math.abs(this.p[1] - midY) / ((top - floor) / 2);
+        const nx = Math.abs(ahead[0]) / halfW;
+        const ny = Math.abs(ahead[1] - midY) / ((top - floor) / 2);
         const nz = Math.abs(dz - midZ) / ((DZ_MAX - DZ_MIN) / 2 * sf);
-        const out = Math.max(nx - 0.72, ny - 0.62, nz - 0.75, 0) / 0.28;
+        const out = Math.max(nx - 0.6, ny - 0.5, nz - 0.6, 0) / 0.4;
         if (out > 0) {
-            const home = norm(sub([0, midY, -midZ], this.p));
+            const home = norm(sub([rand(-0.3, 0.3) * halfW, midY, -midZ], this.p));
             const k = Math.min(1, out);
-            D = norm(add(mul(D, 1 - k), home, k * 1.2));
+            D = norm(add(mul(D, 1 - k), home, k * 1.5));
         }
-        if (this.p[1] < floor * 1.3)
-            D = norm(add(D, UP, 0.5 + 2 * (floor * 1.3 - this.p[1]) / floor));
+        const fl = Math.min(this.p[1], ahead[1]);
+        if (fl < floor * 1.6)
+            D = norm(add(D, UP, 0.6 + 2.5 * (floor * 1.6 - fl) / floor));
 
         this._fly(D);
 
         const vt = SPEED * sf * this.skill *
-            (this.ai === 'evade' ? 1.2 : this.ai === 'extend' ? 1.15 : 1) - this.F[1] * 1.5 * sf;
-        this.v += (vt - this.v) * 0.05;
+            (this.ai === 'evade' ? 1.1 : this.ai === 'extend' ? 1.15 : 1);
+        // thrust towards target speed, gravity along the flight path, induced drag in turns
+        this.v += (vt - this.v) * 0.012 - this.F[1] * GRAV * 0.5 * sf - this.g * this.g * 0.025 * sf;
+        this.v = clamp(this.v, V_MIN * SPEED * sf, 1.35 * SPEED * sf);
 
         // guns
         if (this.cool > 0)
             this.cool--;
         // no head-on passes: only shoot at somebody who isn't pointing back at us
-        if (this.ai === 'attack' && t && dist < 560 * sf && aim < 0.09 && this.cool === 0 &&
+        if (this.ai === 'attack' && t && dist < 700 * sf && aim < 0.11 && this.cool === 0 &&
             dot(this.F, t.F) > -0.3) {
             w.fire(this);
             if (--this.burst > 0) {
@@ -285,29 +297,46 @@ class Jet {
         }
     }
 
-    // put the lift vector on the desired direction and pull
+    // put the lift vector on the desired direction and pull, within the airframe's limits:
+    // roll rate/acceleration and G load (with onset) are limited, so the turn rate is
+    // G / speed — big sweeping turns at speed, no instant reversals.
     _fly(D) {
+        const sf = this.world.sf;
         let F = this.F, U = this.U;
-        const R = ROLL * this.skill * (this.ai === 'evade' ? 1.3 : 1);
-        const P = PULL * this.skill * (this.ai === 'evade' ? 1.25 : 1);
+        const ev = this.ai === 'evade';
+        const Rmax = ROLL * this.skill * (ev ? 1.2 : 1);
         const c = clamp(dot(F, D), -1, 1);
+        const ang = Math.acos(c);
         const E = sub(D, mul(F, c));
         const lvl = Math.abs(F[1]) < 0.97 ? ortho(F, UP) : U;
-        let Ud, q;
-        if (Math.acos(c) < 0.35) {
-            // fine tracking: mostly wings level, bank a bit towards the side
+        let Ud, gt;
+        if (ang < 0.25) {
+            // fine tracking: mostly wings level, bank a bit towards the side, light pull
             const lat = sub(E, mul(lvl, dot(E, lvl)));
             Ud = norm(add(lvl, lat, 5));
-            q = clamp(dot(E, U) * 0.5, -P * 0.4, P);
-            F = norm(add(F, E, 0.16));
+            gt = clamp(dot(E, U) * 4, -0.15, 0.6);
+            const le = len(E);
+            if (le > 1e-6)
+                F = norm(add(F, E, Math.min(0.15, YAW / le)));
             U = ortho(F, U);
         } else {
             Ud = len(E) > 1e-6 ? norm(E) : U;
-            q = P * (dot(U, Ud) > 0.3 ? 1 : 0.3);
+            // only pull hard once the lift vector is roughly on the target
+            const al = dot(U, Ud);
+            gt = al > 0.7 ? 1 : al > 0.2 ? 0.5 : 0.1;
+            // big errors: max G; smaller: proportional
+            gt *= Math.min(1, 0.35 + ang);
         }
+        // G onset
+        this.g += clamp(gt - this.g, -G_ONSET * 1.5, G_ONSET);
+        // roll with limited acceleration
         Ud = ortho(F, Ud);
         const phi = Math.atan2(dot(cross(U, Ud), F), dot(U, Ud));
-        U = rotAround(F, U, clamp(phi, -R, R));
+        const rt = clamp(phi * 0.25, -Rmax, Rmax);
+        this.rr += clamp(rt - this.rr, -ROLL_ACC, ROLL_ACC);
+        U = rotAround(F, U, this.rr);
+        // turn rate from lateral acceleration
+        const q = this.g * G_MAX * sf * this.skill * (ev ? 1.15 : 1) / Math.max(this.v, 1e-3);
         const nF = add(mul(F, Math.cos(q)), U, Math.sin(q));
         const nU = sub(mul(U, Math.cos(q)), mul(F, Math.sin(q)));
         this.F = norm(nF);
