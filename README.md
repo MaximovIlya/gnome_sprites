@@ -7,7 +7,7 @@
 | **Fox Pet** (`fox-pet@local`) | Лиса бегает по низу экрана и по верхним краям окон, сидит, умывается, спит, прыгает. |
 | **Cat Pet** (`cat-pet@local`) | Рыжая кошка с белыми лапками. Умеет всё то же, что лиса: ходит, бегает, запрыгивает на окна, умывается, спит. |
 | **Airship Pet** (`airship-pet@local`) | Дирижабль плывёт по верхней части экрана, покачивается, крутит пропеллером, разворачивается и пускает пар. |
-| **Dogfight** (`dogfight@local`) | Воздушный бой: красные истребители против синих (от 1×1 до 4×4). Погоня с упреждением, очереди трассеров, уход виражом из-под атаки, дым у подбитых, взрывы, счёт в меню. Не перехватывает клики. |
+| **Dogfight** (`dogfight@local`) | Воздушный бой в псевдо-3D: камуфляжные истребители «лес» против «пустыни» (от 1×1 до 4×4), видны сбоку, сверху, снизу, спереди — с креном в виражах и перспективой по глубине. Сбитые падают горящими и взрываются о низ экрана, пилоты катапультируются и спускаются на парашютах. Счёт в меню. Не перехватывает клики. |
 
 ![fox](fox-pet@local/preview.png)
 ![cat](cat-pet@local/preview.png)
@@ -48,7 +48,7 @@ cd gnome_sprites
 python3 fox-pet@local/tools/gen_fox.py fox-pet@local/sprites
 python3 cat-pet@local/tools/gen_cat.py cat-pet@local/sprites
 python3 airship-pet@local/tools/gen_airship.py airship-pet@local/sprites
-python3 dogfight@local/tools/gen_jets.py dogfight@local/sprites
+python3 dogfight@local/tools/gen_sprites3d.py dogfight@local   # 3D-рендер на чистом Python + Pillow
 ```
 
 ## Удаление
