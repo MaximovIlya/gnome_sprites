@@ -12,10 +12,16 @@
 //
 // Shot-down jets fall burning and explode on the ground; pilots eject and come
 // down on parachutes.  v1 (flat top-down pixel art) is kept in v1_backup/.
+//
+// v3: tanks fight on the ground strip along the bottom edge.  The camera sits
+// CAM_H above the ground, so farther tanks stand a little higher on screen.
+// Hull and turret come from one atlas (row 0 hull, row 1 turret), so the
+// turret turns on its own; a killed tank burns and may lose its turret.
 
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import St from 'gi://St';
+import Clutter from 'gi://Clutter';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
@@ -32,6 +38,10 @@ const ATLAS_W = CELL * AZ_N, ATLAS_H = CELL * EL_N;
 const BODY = 0.85 * CELL;          // world units per body-length unit
 const BOOM = 128, BOOM_FRAMES = 8, BOOM_TICKS = 3;
 const PUFF = 40;
+const TCELL = 128;                 // tank atlas cell (must match gen_sprites3d.py)
+const TBODY = 0.75 * TCELL;        // world units per tank body unit
+const TYOFF = 0.16;                // tank model offset inside its cell
+const TEL = 12 * Math.PI / 180;    // camera elevation the tanks were rendered at
 const SPARK = 21;
 const BIT = 12;
 const SEAT = 28;
@@ -52,8 +62,17 @@ const BULLET_SPEED = 24;
 const BULLET_LIFE = 34;
 const HIT_R = 40;
 const GRAV = 0.2;
+const CAM_H = 110;                 // camera height above the ground
+const T_DZ_MIN = 30, T_DZ_MAX = 560;
+const T_HP = 3;
+const T_SPEED = 1.15;
+const T_TURN = 0.028;
+const T_TURRET = 0.032;
+const SHELL_SPEED = 13;
+const SHELL_G = 0.05;
+const SHELL_LIFE = 140;
 
-const DEFAULTS = {visible: true, aboveWindows: true, perTeam: 2};
+const DEFAULTS = {visible: true, aboveWindows: true, perTeam: 2, tanksPerTeam: 2};
 
 const rand = (a, b) => a + Math.random() * (b - a);
 const randi = (a, b) => Math.floor(rand(a, b + 1));
@@ -70,6 +89,8 @@ const norm = a => {
     return [a[0] / l, a[1] / l, a[2] / l];
 };
 const UP = [0, 1, 0];
+const wrapA = a => Math.atan2(Math.sin(a), Math.cos(a));
+const dirA = a => [Math.cos(a), 0, Math.sin(a)];
 
 function sprite(dir, name, w, h) {
     const path = GLib.build_filenamev([dir, 'sprites', `${name}.png`]);
@@ -226,7 +247,7 @@ class Jet {
         const dz = -this.p[2];
         const s = w.focal / (w.focal + dz);
         const halfW = w.W / 2 / s;
-        const top = (w.H - 50 * sf) / s;
+        const top = (w.H - 50 * sf - w.camH * (1 - s)) / s;
         const floor = 120 * sf / s;
         const midY = (top + floor) / 2;
         const midZ = (DZ_MIN + DZ_MAX) / 2 * sf;
@@ -384,6 +405,286 @@ class Jet {
     }
 }
 
+
+// ----------------------------------------------------------------- tanks
+
+class Tank {
+    constructor(world, team) {
+        this.world = world;
+        this.team = team;
+        const sf = world.sf;
+        this.size = TCELL * sf;
+        const path = GLib.build_filenamev([world.dir, 'sprites', `tank_${team}.png`]);
+        const aw = TCELL * AZ_N, ah = TCELL * 2;
+        const style = `background-image: url("${path}"); width: ${aw}px; height: ${ah}px; background-size: ${aw}px ${ah}px;`;
+        const cell = () => {
+            const w = new St.Widget({reactive: false, width: this.size, height: this.size});
+            w.set_pivot_point(0.5, 0.5);
+            return w;
+        };
+        this.actor = cell();
+        this.actor.hide();
+        this.hullFlip = cell();
+        this.hullFlip.clip_to_allocation = true;
+        this.hullAtlas = new St.Widget({reactive: false, style});
+        this.hullFlip.add_child(this.hullAtlas);
+        this.turFrame = cell();
+        this.turFlip = cell();
+        this.turFlip.clip_to_allocation = true;
+        this.turAtlas = new St.Widget({reactive: false, style});
+        this.turFlip.add_child(this.turAtlas);
+        this.turFrame.add_child(this.turFlip);
+        this.actor.add_child(this.hullFlip);
+        this.actor.add_child(this.turFrame);
+        world.mid.add_child(this.actor);
+        this.skill = rand(0.85, 1.15);
+        this.state = 'gone';
+        this.respawnT = 0;
+        this.depth = 0;
+        this._cells = [-1, 0, -1, 0];
+        this._dark = null;
+    }
+
+    get alive() {
+        return this.state === 'fight';
+    }
+
+    get vel() {
+        return this.alive ? mul(dirA(this.a), this.v) : [0, 0, 0];
+    }
+
+    // centre of mass (used for hits)
+    get centre() {
+        return add(this.p, UP, 0.17 * TBODY * this.world.sf);
+    }
+
+    bounds(dz) {
+        const w = this.world;
+        const s = w.focal / (w.focal + dz);
+        return w.W / 2 / s - 70 * w.sf;
+    }
+
+    spawn() {
+        const w = this.world, sf = w.sf;
+        const dz = rand(T_DZ_MIN + 20, T_DZ_MAX - 40) * sf;
+        const side = this.team === 'wood' ? -1 : 1;
+        this.p = [side * (this.bounds(dz) + 150 * sf), 0, -dz];
+        this.a = side < 0 ? rand(-0.3, 0.3) : Math.PI + rand(-0.3, 0.3);
+        this.ta = this.a;
+        this.v = 0;
+        this.hp = T_HP;
+        this.reload = randi(40, 90);
+        this.wp = [side * rand(0.1, 0.6) * this.bounds(dz), 0, this.p[2]];
+        this.wpT = randi(150, 250);
+        this.target = null;
+        this.kick = 0;
+        this.tOff = [0, 0, 0];
+        this.tVel = null;
+        this.tSpin = 0;
+        this.tSpinA = 0;
+        this.age = 0;
+        this.state = 'fight';
+        this._setDark(false);
+        this.actor.opacity = 255;
+        this.turFrame.rotation_angle_z = 0;
+        this.actor.show();
+    }
+
+    _setDark(on) {
+        if (on && !this._dark) {
+            this._dark = new Clutter.BrightnessContrastEffect();
+            this._dark.set_brightness(-0.42);
+            this._dark.set_contrast(-0.15);
+            this.actor.add_effect(this._dark);
+        } else if (!on && this._dark) {
+            this.actor.remove_effect(this._dark);
+            this._dark = null;
+        }
+    }
+
+    _pickWaypoint(t) {
+        const w = this.world, sf = w.sf;
+        let p;
+        if (t) {
+            // keep a fighting distance from the target, from a random angle
+            const from = Math.atan2(this.p[2] - t.p[2], this.p[0] - t.p[0]) + rand(-0.9, 0.9);
+            const R = rand(260, 480) * sf;
+            p = add(t.p, dirA(from), R);
+        } else {
+            p = [rand(-0.7, 0.7) * w.W / 2, 0, -rand(T_DZ_MIN, T_DZ_MAX) * sf];
+        }
+        const dz = clamp(-p[2], T_DZ_MIN * sf, T_DZ_MAX * sf);
+        const hw = this.bounds(dz) * 0.92;
+        this.wp = [clamp(p[0], -hw, hw), 0, -dz];
+        this.wpT = randi(140, 260);
+    }
+
+    think() {
+        const w = this.world, sf = w.sf;
+        const enemies = w.tanks.filter(o => o.alive && o.team !== this.team);
+        let t = null, bd = Infinity;
+        for (const e of enemies) {
+            const d = len(sub(e.p, this.p)) * (e === this.target ? 0.75 : 1);
+            if (d < bd) {
+                bd = d;
+                t = e;
+            }
+        }
+        this.target = t;
+
+        // --- drive
+        if (--this.wpT <= 0 || len(sub(this.wp, this.p)) < 30 * sf)
+            this._pickWaypoint(t);
+        let to = sub(this.wp, this.p);
+        // keep clear of other tanks and wrecks
+        for (const o of w.tanks) {
+            if (o === this || o.state === 'gone')
+                continue;
+            const away = sub(this.p, o.p);
+            const d = len(away);
+            if (d < 120 * sf && d > 0)
+                to = add(to, norm(away), 140 * sf * (1 - d / (120 * sf)) * 2);
+        }
+        const dist = len(to);
+        let speed = 0;
+        if (dist > 25 * sf) {
+            const want = Math.atan2(to[2], to[0]);
+            const err = wrapA(want - this.a);
+            this.a = wrapA(this.a + clamp(err, -T_TURN, T_TURN) * this.skill);
+            speed = T_SPEED * sf * this.skill * Math.max(0, Math.cos(err)) ** 2 * Math.min(1, dist / (90 * sf));
+        }
+        this.v += (speed - this.v) * 0.06;
+
+        // --- turret & gun
+        if (this.reload > 0)
+            this.reload--;
+        let aimErr = Infinity, tdist = Infinity;
+        if (t) {
+            tdist = len(sub(t.p, this.p));
+            const lead = add(t.p, t.vel, tdist / (SHELL_SPEED * sf));
+            const want = Math.atan2(lead[2] - this.p[2], lead[0] - this.p[0]);
+            aimErr = wrapA(want - this.ta);
+            this.ta = wrapA(this.ta + clamp(aimErr, -T_TURRET, T_TURRET) * this.skill);
+        } else {
+            this.ta = wrapA(this.ta + clamp(wrapA(this.a - this.ta), -T_TURRET, T_TURRET) * 0.5);
+        }
+        const onScreen = Math.abs(this.p[0]) < this.bounds(-this.p[2]) + 40 * sf;
+        if (t && this.reload === 0 && Math.abs(aimErr) < 0.035 && tdist < 1300 * sf && onScreen) {
+            w.fireShell(this, t);
+            this.reload = randi(80, 150);
+            this.kick = 1;
+        }
+    }
+
+    muzzle() {
+        const sf = this.world.sf;
+        return add(add(this.p, dirA(this.ta), 0.63 * TBODY * sf), UP, 0.255 * TBODY * sf);
+    }
+
+    tick() {
+        const w = this.world, sf = w.sf;
+        if (this.state === 'gone') {
+            if (--this.respawnT <= 0)
+                this.spawn();
+            return;
+        }
+        this.age++;
+        this.kick *= 0.82;
+        if (this.state === 'fight') {
+            this.think();
+            this.p = add(this.p, dirA(this.a), this.v);
+            if (this.v > 0.35 * sf && this.age % 5 === 0) {
+                const F = dirA(this.a), Z = [-F[2], 0, F[0]];
+                const sd = Math.random() < 0.5 ? 1 : -1;
+                w.fx.puff(add(add(this.p, F, -0.45 * TBODY * sf), Z, sd * 0.22 * TBODY * sf), 'dust',
+                    0.7, randi(30, 45), 0.12);
+            }
+            if (this.hp < T_HP && this.age % 4 === 0)
+                w.fx.puff(this.centre, 'dark', 0.8, 40, 0.5);
+            return;
+        }
+        // 'wreck': burning, the turret may be flying
+        this.wreckT--;
+        if (this.tVel) {
+            this.tVel[1] -= GRAV * sf;
+            this.tOff = add(this.tOff, this.tVel);
+            this.tSpinA += this.tSpin;
+            if (this.age % 2 === 0)
+                w.fx.puff(add(this.p, this.tOff, 1), 'dark', 0.6, 30, 0.2);
+            if (this.tOff[1] <= 0) {
+                this.tOff[1] = 0;
+                this.tVel = null;
+                w.fx.puff(add(this.p, this.tOff), 'dust', 1.2, 40, 0.2);
+            }
+        }
+        if (this.wreckT < 40)
+            this.actor.opacity = Math.round(255 * Math.max(0, this.wreckT) / 40);
+        if (this.wreckT <= 0) {
+            this.state = 'gone';
+            this.actor.hide();
+            this.respawnT = randi(60, 160);
+        }
+    }
+
+    hit(by, dmg = 1) {
+        if (!this.alive)
+            return;
+        this.hp -= dmg;
+        if (this.hp <= 0)
+            this.world.killTank(this, by);
+    }
+
+    _az(dirAngle) {
+        // horizontal direction to the camera in the tank's frame
+        const w = this.world;
+        const cx = -this.p[0], cz = w.focal - this.p[2];
+        const F = dirA(dirAngle);
+        return Math.atan2(F[0] * cz - F[2] * cx, F[0] * cx + F[2] * cz);
+    }
+
+    render() {
+        if (this.state === 'gone')
+            return;
+        const w = this.world, sf = w.sf;
+        this.depth = -this.p[2];
+        const [sx, sy, s] = w.proj(add(this.p, UP, TYOFF * TBODY * sf * Math.cos(TEL)));
+        const c = this._cells;
+        const ah = this._az(this.a);
+        const hc = clamp(Math.round(Math.abs(ah) / AZ_STEP), 0, AZ_N - 1);
+        const hf = ah < 0 ? -1 : 1;
+        if (c[0] !== hc) {
+            this.hullAtlas.set_position(-hc * TCELL * sf, 0);
+            c[0] = hc;
+        }
+        if (c[1] !== hf) {
+            this.hullFlip.scale_x = hf;
+            c[1] = hf;
+        }
+        const at = this._az(this.ta);
+        const tc = clamp(Math.round(Math.abs(at) / AZ_STEP), 0, AZ_N - 1);
+        const tf = at < 0 ? -1 : 1;
+        if (c[2] !== tc) {
+            this.turAtlas.set_position(-tc * TCELL * sf, -TCELL * sf);
+            c[2] = tc;
+        }
+        if (c[3] !== tf) {
+            this.turFlip.scale_x = tf;
+            c[3] = tf;
+        }
+        // recoil: the turret jerks back along the gun for a moment
+        const T = dirA(this.ta);
+        const kx = -T[0] * this.kick * 5 * sf;
+        this.turFrame.set_position(Math.round(this.tOff[0] + kx), Math.round(-this.tOff[1]));
+        this.turFrame.rotation_angle_z = this.tSpinA;
+        this.actor.set_position(Math.round(sx - this.size / 2), Math.round(sy - this.size / 2));
+        this.actor.set_scale(s, s);
+    }
+
+    destroy() {
+        this.actor.destroy();
+    }
+}
+
 // ---------------------------------------------------------------- pilots
 
 class Pilot {
@@ -494,7 +795,7 @@ class Pilot {
 class Effects {
     constructor(world) {
         this.world = world;
-        this._puffs = {smoke: [], dark: [], fire: []};
+        this._puffs = {smoke: [], dark: [], fire: [], dust: []};
         this._sparks = [];
         this._booms = [];
         this._bits = [];
@@ -589,6 +890,16 @@ class Effects {
         it.actor.show();
     }
 
+    // a shell hitting the dirt
+    dirt(p) {
+        const sf = this.world.sf;
+        this.boom(p, 0.35, [0, 0, 0], true);
+        for (let k = 0; k < 4; k++)
+            this.puff(add(p, [rand(-12, 12) * sf, rand(0, 10) * sf, 0]), 'dust', 1.4, randi(40, 60), 0.35);
+        for (let k = 0; k < 4; k++)
+            this.bit(add(p, [0, 4 * sf, 0]), [rand(-2.5, 2.5) * sf, rand(3, 6) * sf, rand(-2, 2) * sf], 'debris', 0.6);
+    }
+
     groundBoom(p, v) {
         const sf = this.world.sf;
         this.boom(p, 2.0, [0, 0, 0], true);
@@ -600,7 +911,12 @@ class Effects {
         for (let k = 0; k < 8; k++)
             this.puff(add(p, [rand(-40, 40) * sf, rand(0, 40) * sf, 0]), 'dark', 2.2, randi(50, 80), 0.8);
         // burning wreck: a column of smoke for a few seconds
-        this._sites.push({p: [...p], life: 110});
+        this._sites.push({p: [...p], life: 110, max: 110});
+    }
+
+    // a burning tank wreck
+    wreckFire(p, life) {
+        this._sites.push({p: [...p], life, max: life});
     }
 
     tick() {
@@ -608,7 +924,7 @@ class Effects {
         for (const s of this._sites) {
             s.life--;
             if (s.life % 2 === 0)
-                this.puff(add(s.p, [rand(-14, 14) * sf, 4 * sf, 0]), 'dark', 2.2 * s.life / 110 + 0.9, randi(60, 90), 1.1);
+                this.puff(add(s.p, [rand(-14, 14) * sf, 4 * sf, 0]), 'dark', 2.2 * s.life / s.max + 0.9, randi(60, 90), 1.1);
             if (s.life % 4 === 0 && s.life > 30)
                 this.puff(add(s.p, [rand(-10, 10) * sf, 6 * sf, 0]), 'fire', 0.9, 10, 0.6);
         }
@@ -712,10 +1028,11 @@ class Effects {
 // ----------------------------------------------------------------- world
 
 class World {
-    constructor(dir, perTeam, onScore) {
+    constructor(dir, perTeam, tanksPerTeam, onScore) {
         this.dir = dir;
         this.sf = St.ThemeContext.get_for_stage(global.stage).scale_factor;
         this.focal = FOCAL * this.sf;
+        this.camH = CAM_H * this.sf;
         this.onScore = onScore;
         this.layer = new St.Widget({reactive: false});
         // back: smoke & debris, mid: depth-sorted jets/pilots/fireballs, front: bullets & sparks
@@ -730,13 +1047,17 @@ class World {
         });
         this.dead = false;
         this.score = {wood: 0, desert: 0};
+        this.tankScore = {wood: 0, desert: 0};
         this.fx = new Effects(this);
+        this.tanks = [];
+        this.shells = [];
         this.bullets = [];
         this.jets = [];
         this.pilots = [];
         this._order = [];
         this.updateBounds();
         this.setPerTeam(perTeam);
+        this.setTanks(tanksPerTeam);
     }
 
     updateBounds() {
@@ -754,7 +1075,7 @@ class World {
 
     proj(p) {
         const s = this.focal / (this.focal - p[2]);
-        return [this.cx + p[0] * s, this.gy - p[1] * s, s];
+        return [this.cx + p[0] * s, this.gy - this.camH * (1 - s) - p[1] * s, s];
     }
 
     setPerTeam(n) {
@@ -777,11 +1098,93 @@ class World {
         }
     }
 
+    setTanks(n) {
+        this.tanks.forEach(t => t.destroy());
+        this.tanks = [];
+        this.shells.forEach(b => {
+            b.life = 0;
+            b.actor.hide();
+        });
+        this._order = [];
+        for (const team of TEAMS) {
+            for (let i = 0; i < n; i++) {
+                const t = new Tank(this, team);
+                t.spawn();
+                // the first wave starts on screen already
+                t.p[0] = (team === 'wood' ? -1 : 1) * rand(0.45, 0.9) * t.bounds(-t.p[2]);
+                this.tanks.push(t);
+            }
+        }
+    }
+
     reset() {
         this.score = {wood: 0, desert: 0};
-        this.onScore?.(this.score);
+        this.tankScore = {wood: 0, desert: 0};
+        this.onScore?.(this.score, this.tankScore);
         this.setPerTeam(this.jets.length / 2);
+        this.setTanks(this.tanks.length / 2);
     }
+
+    fireShell(t, target) {
+        const sf = this.sf;
+        let b = this.shells.find(x => x.life <= 0);
+        if (!b) {
+            if (this.shells.length >= 40)
+                return;
+            const actor = new St.Widget({
+                reactive: false, visible: false,
+                style: 'background-color: #fff3b0; border-radius: 2px; box-shadow: 0 0 4px #ff9a30;',
+            });
+            actor.set_size(16 * sf, 4 * sf);
+            actor.set_pivot_point(0.5, 0.5);
+            this.front.add_child(actor);
+            b = {actor};
+            this.shells.push(b);
+        }
+        const m = t.muzzle();
+        const tc = target.centre;
+        const dist = Math.hypot(tc[0] - m[0], tc[2] - m[2]);
+        const vh = SHELL_SPEED * sf;
+        const time = dist / vh * rand(0.94, 1.06);
+        const ang = t.ta + rand(-0.03, 0.03) * (0.6 + dist / (700 * sf));
+        const g = SHELL_G * sf;
+        const vy = (tc[1] - m[1]) / time + 0.5 * g * time;
+        Object.assign(b, {p: m, v: add(mul(dirA(ang), vh), UP, vy), life: SHELL_LIFE, owner: t});
+        b.actor.show();
+        // muzzle blast
+        const F = dirA(t.ta);
+        this.fx.puff(add(m, F, 6 * sf), 'fire', 1.0, 6, 0);
+        this.fx.puff(add(m, F, 14 * sf), 'fire', 0.7, 5, 0);
+        for (let k = 0; k < 4; k++)
+            this.fx.puff(add(m, F, rand(4, 26) * sf), 'smoke', rand(0.6, 1.1), randi(25, 40), 0.25);
+        this.fx.puff(add(t.p, F, -10 * sf), 'dust', 1.4, 40, 0.2);
+    }
+
+    killTank(t, by) {
+        const sf = this.sf;
+        t.state = 'wreck';
+        t.v = 0;
+        t.wreckT = randi(330, 420);
+        t._setDark(true);
+        const c = t.centre;
+        this.fx.boom(add(c, UP, 6 * sf), 1.5, [0, 0, 0], true);
+        this.fx.boom(add(c, [rand(-20, 20) * sf, 30 * sf, 0]), 0.9, [0, 0.8 * sf, 0]);
+        for (let k = 0; k < 8; k++)
+            this.fx.bit(c, [rand(-5, 5) * sf, rand(4, 10) * sf, rand(-4, 4) * sf], 'debris', rand(0.7, 1.4));
+        for (let k = 0; k < 5; k++)
+            this.fx.puff(add(c, [rand(-30, 30) * sf, rand(0, 30) * sf, 0]), 'dark', 2.0, randi(50, 80), 0.8);
+        this.fx.wreckFire(c, t.wreckT - 40);
+        // ammo cook-off: the turret is thrown into the air
+        if (Math.random() < 0.6) {
+            t.tVel = [rand(-2.5, 2.5) * sf, rand(7, 11) * sf, 0];
+            t.tSpin = rand(-14, 14);
+        }
+        if (by && by.team !== t.team) {
+            this.tankScore[by.team]++;
+            this.onScore?.(this.score, this.tankScore);
+        }
+    }
+
 
     fire(j) {
         const sf = this.sf;
@@ -821,7 +1224,7 @@ class World {
             this.fx.bit(j.p, add(j.dv, [rand(-4, 4), rand(-1, 5), rand(-4, 4)], sf * 0.8), 'debris', 0.8);
         if (by && by.team !== j.team) {
             this.score[by.team]++;
-            this.onScore?.(this.score);
+            this.onScore?.(this.score, this.tankScore);
         }
     }
 
@@ -832,6 +1235,12 @@ class World {
 
     crash(j) {
         this.fx.groundBoom([j.p[0], 0, j.p[2]], j.dv);
+        // a jet falling onto a tank takes it out
+        for (const t of this.tanks) {
+            const d = Math.hypot(t.p[0] - j.p[0], t.p[2] - j.p[2]);
+            if (t.alive && d < 110 * this.sf)
+                t.hit(null, d < 60 * this.sf ? T_HP : 2);
+        }
         j.state = 'dead';
         j.actor.hide();
         j.respawnT = randi(70, 130);
@@ -873,6 +1282,10 @@ class World {
             b.actor.rotation_angle_z = Math.atan2(svy, svx) * 180 / Math.PI;
         }
 
+        for (const t of this.tanks)
+            t.tick();
+        this._tickShells();
+
         for (const p of this.pilots)
             p.tick();
         this.pilots = this.pilots.filter(p => {
@@ -884,9 +1297,55 @@ class World {
         this.fx.tick();
         for (const j of this.jets)
             j.render();
+        for (const t of this.tanks)
+            t.render();
         for (const p of this.pilots)
             p.render();
         this._sort();
+    }
+
+    _tickShells() {
+        const sf = this.sf;
+        const hr = 0.36 * TBODY * sf;
+        const g = SHELL_G * sf;
+        for (const b of this.shells) {
+            if (b.life <= 0)
+                continue;
+            b.v[1] -= g;
+            b.p = add(b.p, b.v);
+            let gone = --b.life <= 0;
+            for (const t of this.tanks) {
+                if (gone)
+                    break;
+                if (!t.alive || t.team === b.owner.team)
+                    continue;
+                const c = t.centre;
+                if (Math.hypot(c[0] - b.p[0], c[2] - b.p[2]) < hr && b.p[1] < 0.42 * TBODY * sf) {
+                    this.fx.spark(b.p);
+                    this.fx.spark(add(b.p, [4 * sf, 3 * sf, 0]));
+                    this.fx.boom(b.p, 0.45, [0, 0, 0]);
+                    this.fx.puff(b.p, 'dark', 1.0, 40, 0.4);
+                    t.hit(b.owner);
+                    gone = true;
+                }
+            }
+            if (!gone && b.p[1] <= 0) {
+                this.fx.dirt([b.p[0], 0, b.p[2]]);
+                gone = true;
+            }
+            if (gone) {
+                b.life = 0;
+                b.actor.hide();
+                continue;
+            }
+            const [sx, sy, s] = this.proj(b.p);
+            const [nx, ny] = this.proj(add(b.p, b.v));
+            const svx = nx - sx, svy = ny - sy;
+            const k = clamp(Math.hypot(svx, svy) / (SHELL_SPEED * sf), 0.3, 1);
+            b.actor.set_position(Math.round(sx - 8 * sf), Math.round(sy - 2 * sf));
+            b.actor.set_scale(s * k, s);
+            b.actor.rotation_angle_z = Math.atan2(svy, svx) * 180 / Math.PI;
+        }
     }
 
     // far things first
@@ -895,6 +1354,10 @@ class World {
         for (const j of this.jets) {
             if (j.state !== 'dead')
                 items.push({actor: j.actor, depth: j.depth});
+        }
+        for (const t of this.tanks) {
+            if (t.state !== 'gone')
+                items.push({actor: t.actor, depth: t.depth});
         }
         for (const p of this.pilots)
             items.push({actor: p.actor, depth: p.depth});
@@ -926,8 +1389,10 @@ export default class DogfightExtension extends Extension {
         this._settingsPath = GLib.build_filenamev([GLib.get_user_config_dir(), 'dogfight.json']);
         this._settings = {...DEFAULTS, ...this._loadSettings()};
         this._settings.perTeam = clamp(Math.round(this._settings.perTeam) || 2, 1, 4);
+        this._settings.tanksPerTeam = clamp(Math.round(this._settings.tanksPerTeam ?? 2), 0, 4);
 
-        this._world = new World(this.path, this._settings.perTeam, s => this._updateScore(s));
+        this._world = new World(this.path, this._settings.perTeam, this._settings.tanksPerTeam,
+            (s, ts) => this._updateScore(s, ts));
         this._placeActor();
         this._buildIndicator();
 
@@ -1018,9 +1483,11 @@ export default class DogfightExtension extends Extension {
         this._world.layer.visible = this._settings.visible && !Main.overview.visible && !fullscreen;
     }
 
-    _updateScore(s) {
+    _updateScore(s, ts) {
         if (this._scoreItem)
-            this._scoreItem.label.text = `Счёт: ${TEAM_NAMES.wood} ${s.wood} : ${s.desert} ${TEAM_NAMES.desert}`;
+            this._scoreItem.label.text = `Самолёты: ${TEAM_NAMES.wood} ${s.wood} : ${s.desert} ${TEAM_NAMES.desert}`;
+        if (this._tankScoreItem)
+            this._tankScoreItem.label.text = `Танки: ${TEAM_NAMES.wood} ${ts.wood} : ${ts.desert} ${TEAM_NAMES.desert}`;
     }
 
     _buildIndicator() {
@@ -1033,7 +1500,9 @@ export default class DogfightExtension extends Extension {
 
         this._scoreItem = new PopupMenu.PopupMenuItem('', {reactive: false});
         menu.addMenuItem(this._scoreItem);
-        this._updateScore(this._world.score);
+        this._tankScoreItem = new PopupMenu.PopupMenuItem('', {reactive: false});
+        menu.addMenuItem(this._tankScoreItem);
+        this._updateScore(this._world.score, this._world.tankScore);
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         const show = new PopupMenu.PopupSwitchMenuItem('Показывать бой', this._settings.visible);
@@ -1066,6 +1535,20 @@ export default class DogfightExtension extends Extension {
             items.push(it);
         }
         menu.addMenuItem(sub);
+
+        const tsub = new PopupMenu.PopupSubMenuMenuItem('Танков в команде');
+        const titems = [];
+        for (let n = 0; n <= 4; n++) {
+            const it = tsub.menu.addAction(n === 0 ? 'без танков' : `${n} × ${n}`, () => {
+                this._settings.tanksPerTeam = n;
+                this._saveSettings();
+                this._world.setTanks(n);
+                titems.forEach((x, k) => x.setOrnament(k === n ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE));
+            });
+            it.setOrnament(n === this._settings.tanksPerTeam ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+            titems.push(it);
+        }
+        menu.addMenuItem(tsub);
 
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         menu.addAction('Новый бой', () => this._world.reset());

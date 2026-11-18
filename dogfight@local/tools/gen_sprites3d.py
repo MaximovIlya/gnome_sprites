@@ -362,10 +362,10 @@ def cam_basis(az, el):
     return d, fwd, right, up
 
 
-def render(m, colors, az, el, size=CELL):
+def render(m, colors, az, el, size=CELL, kk=K):
     d, fwd, right, up = cam_basis(az, el)
     S = size * SS
-    k = K * S
+    k = kk * S
     cx = cy = S / 2
     img = Image.new('RGBA', (S, S), (0, 0, 0, 0))
     dr = ImageDraw.Draw(img)
@@ -460,7 +460,7 @@ def puff(kind, size=40):
     img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     px = img.load()
     c = size / 2
-    seed = {'smoke': 1, 'dark': 2, 'fire': 3}[kind]
+    seed = {'smoke': 1, 'dark': 2, 'fire': 3, 'dust': 4}[kind]
     for y in range(size):
         for x in range(size):
             dd = math.hypot(x - c + 0.5, y - c + 0.5) / c
@@ -472,6 +472,8 @@ def puff(kind, size=40):
             if kind == 'smoke':
                 g = int(lerp(220, 175, nz))
                 col, a = (g, g, g + 4), a * 0.8
+            elif kind == 'dust':
+                col, a = (int(lerp(196, 150, nz)), int(lerp(172, 128, nz)), int(lerp(130, 92, nz))), a * 0.75
             elif kind == 'dark':
                 g = int(lerp(70, 30, nz))
                 col, a = (g, g - 2, g - 4), a * 0.9
@@ -611,6 +613,213 @@ def chute(team, w=72, h=96):
     return img.resize((w, h), Image.LANCZOS)
 
 
+
+# ------------------------------------------------------------------ tanks
+#
+# Same body-frame convention as the jet (x = forward, y = up).  Hull and
+# turret are separate meshes rendered into two rows of one atlas, so the
+# extension can turn the turret independently: row 0 = hull, row 1 = turret,
+# columns = azimuth 0..180 (mirrored for negative), fixed camera elevation.
+# Both are rendered around the same origin (turret ring = hull origin).
+
+TCELL = 128
+TK = 0.75                    # sprite px per body unit = TK * TCELL
+TEL = 12.0                   # camera elevation of the tank sprites
+TYOFF = 0.16                 # model is shifted down so it sits mid-cell
+
+TRACK = (44, 42, 38)
+TRACK_D = (28, 27, 25)
+TRACK_L = (64, 62, 56)
+RUBBER = (34, 34, 32)
+HUB = (108, 108, 98)
+
+
+def face_n(m, pts, n, part, paint=None, bias=0.0, spec=0.06):
+    idx = [m.vert(p) for p in pts]
+    c = (0.0, 0.0, 0.0)
+    for p in pts:
+        c = add(c, p)
+    c = mul(c, 1 / len(pts))
+    m.faces.append({'idx': idx, 'n': n, 'c': c, 'part': part, 'spec': spec,
+                    'paint': paint, 'bias': bias})
+
+
+def _subdiv(poly, step):
+    out = []
+    for i, a in enumerate(poly):
+        b = poly[(i + 1) % len(poly)]
+        n = max(1, math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / step))
+        for k in range(n):
+            out.append((lerp(a[0], b[0], k / n), lerp(a[1], b[1], k / n)))
+    return out
+
+
+def extrude_z(m, poly, z0, z1, part, step=0.035, caps=(True, True), paint=None):
+    """Convex (x, y) profile extruded between z0 and z1."""
+    cx = sum(p[0] for p in poly) / len(poly)
+    cy = sum(p[1] for p in poly) / len(poly)
+    sp = _subdiv(poly, step)
+    for i, a in enumerate(sp):
+        b = sp[(i + 1) % len(sp)]
+        en = norm((b[1] - a[1], a[0] - b[0], 0))
+        if dot(en, ((a[0] + b[0]) / 2 - cx, (a[1] + b[1]) / 2 - cy, 0)) < 0:
+            en = mul(en, -1)
+        m.face([m.vert((a[0], a[1], z0)), m.vert((b[0], b[1], z0)),
+                m.vert((b[0], b[1], z1)), m.vert((a[0], a[1], z1))], part, lambda c, en=en: en,
+               paint=paint)
+    if caps[0]:
+        face_n(m, [(x, y, z0) for x, y in poly], (0, 0, -1), part, paint)
+    if caps[1]:
+        face_n(m, [(x, y, z1) for x, y in poly], (0, 0, 1), part, paint)
+
+
+def wheel(m, centre, sg, rings, bias=0.0):
+    """Concentric discs facing +-z: rings = [(r, colour), ...] outer first."""
+    n = (0, 0, sg)
+    for k, (r, col) in enumerate(rings):
+        pts = []
+        for j in range(16):
+            a = j / 16 * 2 * math.pi
+            pts.append((centre[0] + r * math.cos(a), centre[1] + r * math.sin(a),
+                        centre[2] + sg * 0.0012 * k))
+        face_n(m, pts, n, 'wheel', ('rgb', col), bias=bias - 0.004 * (k + 1))
+
+
+def cyl_x(m, x0, x1, r0, r1, yc, zc, part, nu=6, nv=14, spec=0.15):
+    def fn(u, v):
+        th = v * 2 * math.pi
+        r = lerp(r0, r1, u)
+        return (lerp(x0, x1, u), yc + r * math.sin(th), zc + r * math.cos(th))
+    m.grid(fn, nu, nv, part, lambda c: (0, c[1] - yc, c[2] - zc), wrap_v=True, spec=spec)
+
+
+def build_hull(liv):
+    m = Mesh()
+    # lower/upper hull between the tracks
+    extrude_z(m, [(0.47, 0.11), (0.30, 0.205), (-0.45, 0.205), (-0.47, 0.17), (-0.45, 0.07),
+                  (0.38, 0.05)], -0.175, 0.175, 'hull')
+    dark = tuple(int(c * 0.6) for c in liv['camo'][1])
+    for sg in (1, -1):
+        z0, z1 = sg * 0.175, sg * 0.262
+        lo, hi = min(z0, z1), max(z0, z1)
+        # track run (outer side cap only; the inner one is never seen)
+        extrude_z(m, [(0.50, 0.085), (0.47, 0.13), (-0.47, 0.13), (-0.50, 0.085), (-0.44, 0.004),
+                      (0.44, 0.004)], lo, hi, 'track', step=0.022,
+                  caps=(True, True))
+        # fender
+        extrude_z(m, [(0.48, 0.138), (0.47, 0.156), (-0.485, 0.156), (-0.485, 0.138)],
+                  sg * 0.17 if sg > 0 else -0.274, 0.274 if sg > 0 else -0.17, 'fender')
+        # stowage box on the rear fender
+        extrude_z(m, [(-0.2, 0.156), (-0.2, 0.192), (-0.42, 0.192), (-0.42, 0.156)],
+                  0.19 if sg > 0 else -0.26, 0.26 if sg > 0 else -0.19, 'box')
+        # road wheels, drive sprocket, idler
+        zw = sg * 0.2635
+        for k in range(6):
+            x = lerp(-0.34, 0.34, k / 5)
+            wheel(m, (x, 0.058, zw), sg, [(0.05, RUBBER), (0.04, dark), (0.016, HUB)])
+        wheel(m, (0.445, 0.088, zw), sg, [(0.038, TRACK_D), (0.03, (62, 60, 54)), (0.012, HUB)])
+        wheel(m, (-0.445, 0.088, zw), sg, [(0.036, TRACK_D), (0.028, dark), (0.012, HUB)])
+    # exhaust grille on the engine deck
+    face_n(m, [(-0.42, 0.2065, -0.11), (-0.28, 0.2065, -0.11), (-0.28, 0.2065, 0.11),
+               (-0.42, 0.2065, 0.11)], (0, 1, 0), 'grille', bias=-0.01)
+    return m
+
+
+def build_turret(liv):
+    m = Mesh()
+    foot = [(0.20, 0.075), (0.12, 0.165), (-0.12, 0.17), (-0.25, 0.12), (-0.25, -0.12),
+            (-0.12, -0.17), (0.12, -0.165), (0.20, -0.075)]
+    y0, y1, sc, ox = 0.205, 0.30, 0.8, -0.02
+    top = [(ox + (x - ox) * sc, z * sc) for x, z in foot]
+    for i in range(len(foot)):
+        a, b = foot[i], foot[(i + 1) % len(foot)]
+        at, bt = top[i], top[(i + 1) % len(foot)]
+        mid = ((a[0] + b[0]) / 2 - ox, 0.3, (a[1] + b[1]) / 2)
+        for k in range(4):   # split vertically a bit for nicer camo
+            t0, t1 = k / 4, (k + 1) / 4
+            q = [(lerp(a[0], at[0], t0), lerp(y0, y1, t0), lerp(a[1], at[1], t0)),
+                 (lerp(b[0], bt[0], t0), lerp(y0, y1, t0), lerp(b[1], bt[1], t0)),
+                 (lerp(b[0], bt[0], t1), lerp(y0, y1, t1), lerp(b[1], bt[1], t1)),
+                 (lerp(a[0], at[0], t1), lerp(y0, y1, t1), lerp(a[1], at[1], t1))]
+            m.face([m.vert(p) for p in q], 'turret', lambda c, mid=mid: mid)
+    face_n(m, [(x, y1, z) for x, z in top], (0, 1, 0), 'turret')
+    # mantlet, barrel, muzzle brake
+    extrude_z(m, [(0.165, 0.222), (0.225, 0.232), (0.225, 0.278), (0.165, 0.288)], -0.058, 0.058,
+              'mantlet', step=0.03)
+    cyl_x(m, 0.22, 0.585, 0.02, 0.017, 0.255, 0.0, 'barrel', nu=8)
+    cyl_x(m, 0.57, 0.625, 0.026, 0.026, 0.255, 0.0, 'muzzle', nu=2, spec=0.3)
+    face_n(m, [(0.625, 0.255 + 0.026 * math.sin(a), 0.026 * math.cos(a))
+               for a in [j / 12 * 2 * math.pi for j in range(12)]], (1, 0, 0), 'bore')
+    # commander's cupola + hatch
+    cx, cz, r = -0.09, 0.07, 0.046
+    m.grid(lambda u, v: (cx + r * math.cos(v * 2 * math.pi), lerp(0.295, 0.33, u),
+                         cz + r * math.sin(v * 2 * math.pi)), 2, 14, 'cupola',
+           lambda c: (c[0] - cx, 0, c[2] - cz), wrap_v=True)
+    face_n(m, [(cx + r * math.cos(a), 0.33, cz + r * math.sin(a))
+               for a in [j / 14 * 2 * math.pi for j in range(14)]], (0, 1, 0), 'cupola')
+    # loader's hatch
+    face_n(m, [(-0.06 + 0.035 * math.cos(a), 0.3015, -0.075 + 0.035 * math.sin(a))
+               for a in [j / 12 * 2 * math.pi for j in range(12)]], (0, 1, 0), 'hatch', bias=-0.01)
+    # team roundels on both turret cheeks
+    for sg in (1, -1):
+        A = (0.12, y0, sg * 0.165)
+        B = (-0.12, y0, sg * 0.17)
+        At = (ox + (0.12 - ox) * sc, y1, sg * 0.165 * sc)
+        Bt = (ox + (-0.12 - ox) * sc, y1, sg * 0.17 * sc)
+        n = norm(cross(sub(B, A), sub(At, A)))
+        if n[2] * sg < 0:
+            n = mul(n, -1)
+        c = mul(add(add(A, B), add(At, Bt)), 0.25)
+        u = norm(sub(B, A))
+        v = norm(cross(n, u))
+        for k, rr in enumerate((0.034, 0.023, 0.011)):
+            cc = add(c, n, 0.0015 + 0.0008 * k)
+            pts = [add(add(cc, u, rr * math.cos(a)), v, rr * math.sin(a))
+                   for a in [j / 16 * 2 * math.pi for j in range(16)]]
+            face_n(m, pts, n, 'decal', ('roundel', k), bias=-0.012 - 0.004 * k)
+    return m
+
+
+def tank_color(f, liv):
+    p, n, part, paint = f['c'], f['n'], f['part'], f['paint']
+    if isinstance(paint, tuple) and paint:
+        if paint[0] == 'roundel':
+            return liv['roundel'][paint[1]]
+        if paint[0] == 'rgb':
+            return paint[1]
+    if part == 'track':
+        if abs(n[2]) > 0.7:
+            return TRACK
+        return TRACK_D if int((p[0] + 2) * 46) % 2 else TRACK_L
+    if part == 'muzzle':
+        return METAL_D
+    if part == 'bore':
+        return (12, 12, 12)
+    if part == 'grille':
+        return (40, 40, 36)
+    if part == 'hatch':
+        return tuple(int(c * 0.75) for c in camo(liv, mul(p, 0.8)))
+    col = camo(liv, mul(p, 0.8))
+    if n[1] < -0.5:
+        col = tuple(int(c * 0.7) for c in col)
+    return col
+
+
+def shift(m, dy):
+    m.v = [(x, y + dy, z) for x, y, z in m.v]
+
+
+def tank_atlas(liv_name, dst):
+    liv = LIVERIES[liv_name]
+    sheet = Image.new('RGBA', (TCELL * AZ_N, TCELL * 2), (0, 0, 0, 0))
+    for row, mesh in enumerate((build_hull(liv), build_turret(liv))):
+        shift(mesh, -TYOFF)
+        colors = [tank_color(f, liv) for f in mesh.faces]
+        for c in range(AZ_N):
+            sheet.paste(render(mesh, colors, c * AZ_STEP, TEL, TCELL, TK), (c * TCELL, row * TCELL))
+    sheet.save(os.path.join(dst, f'tank_{liv_name}.png'), optimize=True)
+    return sheet
+
 # ------------------------------------------------------------------- main
 
 def main(root):
@@ -619,6 +828,13 @@ def main(root):
     only = os.environ.get('ONLY')
     m = build()
     print(f'mesh: {len(m.v)} verts, {len(m.faces)} faces')
+    if only in (None, 'tanks'):
+        for liv in LIVERIES:
+            tank_atlas(liv, dst)
+            print('tank', liv, 'done')
+        puff('dust').save(os.path.join(dst, 'puff_dust.png'))
+        if only == 'tanks':
+            return
     if only != 'fx':
         sheets = {}
         for liv in LIVERIES:
@@ -638,7 +854,7 @@ def main(root):
     if only != 'jets':
         for i in range(8):
             fireball(i).save(os.path.join(dst, f'boom_{i}.png'))
-        for kind in ('smoke', 'dark', 'fire'):
+        for kind in ('smoke', 'dark', 'fire', 'dust'):
             puff(kind).save(os.path.join(dst, f'puff_{kind}.png'))
         spark().save(os.path.join(dst, 'spark.png'))
         debris().save(os.path.join(dst, 'debris.png'))

@@ -1,7 +1,7 @@
 {
   "uuid": "dogfight@local",
   "name": "Dogfight",
-  "description": "Camouflaged 3D fighter jets dogfighting over your desktop: burning crashes, ejecting pilots, parachutes.",
+  "description": "Camouflaged 3D fighter jets dogfighting over your desktop: burning crashes, ejecting pilots, parachutes; tanks battling on the ground.",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 2
+  "version": 3
 }
